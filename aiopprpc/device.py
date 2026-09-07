@@ -54,7 +54,7 @@ class Device:
     """
 
     def __init__(self, ip_address: str, on_video_state_change=None, on_event=None,
-                 prefix: str = PREFIX):
+                 on_reconnect=None, prefix: str = PREFIX):
         self.ip_address = ip_address
         self.prefix = prefix
         self.descriptor: DeviceDescriptor | None = None
@@ -62,6 +62,14 @@ class Device:
         self._session: Session | None = None
         self.on_video_state_change = on_video_state_change
         self.on_event = on_event
+        # Called once after a successful auto-reconnect, in the same task
+        # that re-established the session. Use this to drive the head back
+        # to a known position: the FT04 reboots to (0, 0) and has no
+        # working preset storage, so a reconnect is the natural place to
+        # replay a recorded move sequence (see ``Device.home`` /
+        # ``Device.recall_preset``). Exceptions are logged and swallowed
+        # so a buggy callback doesn't kill the reconnect.
+        self.on_reconnect = on_reconnect
 
         self.enable_reconnect = False
         self._reconnect_task = None
@@ -141,6 +149,14 @@ class Device:
                     await self.start_video()
                 if self._want_audio:
                     await self.start_audio()
+                if self.on_reconnect is not None:
+                    try:
+                        await self.on_reconnect(self)
+                    except Exception as err:
+                        logger.warning(
+                            'on_reconnect hook for %s raised %s; ignoring',
+                            self.ip_address, err,
+                        )
                 return
             except asyncio.CancelledError:
                 raise
@@ -240,6 +256,48 @@ class Device:
 
     async def ptz_step(self, direction, duration=1.2):
         return await self.session.ptz_step(direction, duration)
+
+    # --- preset / cruise experiments -------------------------------------
+    # The new SDK's PtzCtrl has the cruise-control code space 1..4/22/24
+    # (extracted from libgojni.so via Ghidra). Whether the FT04 firmware
+    # accepts them is the open question these methods exist to test.
+    # See docs/SDK_COMMANDS_EXTRACTED.md.
+    async def ptz_raw(self, func_code, para1=0, para2=0, channel=0):
+        return await self.session.ptz_raw(func_code, para1, para2, channel)
+
+    async def ptz_preset_begin(self, preset_id, channel=0):
+        return await self.session.ptz_preset_begin(preset_id, channel)
+
+    async def ptz_preset_end(self, preset_id, channel=0):
+        return await self.session.ptz_preset_end(preset_id, channel)
+
+    async def ptz_preset_call(self, preset_id, channel=0):
+        return await self.session.ptz_preset_call(preset_id, channel)
+
+    async def ptz_preset_delete(self, preset_id, channel=0):
+        return await self.session.ptz_preset_delete(preset_id, channel)
+
+    async def ptz_cruise_start(self, dwell_secs, channel=0):
+        return await self.session.ptz_cruise_start(dwell_secs, channel)
+
+    async def ptz_cruise_stop(self, channel=0):
+        return await self.session.ptz_cruise_stop(channel)
+
+    # --- position-less "home" + recorded move sequence ---------------------
+    # The FT04 has no working preset storage. The head reboots to (0, 0)
+    # and the only way to land on a known position is to drive the head
+    # there from (0, 0) using timed moves. See Session.home / .recall_preset
+    # for the rationale.
+    async def home(self, traverse_secs: float = 18.0):
+        """Slam the PTZ head to the (0, 0) corner. See Session.home."""
+        return await self.session.home(traverse_secs)
+
+    async def recall_preset(self, sequence, settle_secs: float = 0.4):
+        """Replay a recorded sequence of (direction, duration) from home."""
+        return await self.session.recall_preset(sequence, settle_secs)
+
+    async def send_raw_command(self, cmdid, body_hex='', timeout=None):
+        return await self.session.send_raw_command(cmdid, body_hex, timeout)
 
     async def get_network_info(self):
         return await self.session.get_network_info()

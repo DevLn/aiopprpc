@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 tasks = {}
 new_device_fut = None
 
+#: dev_ids that were previously connected and then lost. When such a device
+#: is rediscovered and reconnected, home() is called to drive the head back
+#: to the (0, 0) corner. The FT04 has no persistent preset storage, so a
+#: reconnect after a reboot or connection loss is the only cue we have that
+#: the head may no longer be at home.
+_was_connected: set[str] = set()
+
 
 def notify_new_device():
     fut = new_device_fut
@@ -36,12 +43,20 @@ def on_device_found(device):
     if not device.lsign:
         logger.warning('%s answered without an lsign; cannot authenticate', device)
         return
+    is_reconnect = device.dev_id in _was_connected
     session = make_session(device, on_device_lost=on_device_lost,
                            on_event=lambda name, payload: logger.info(
                                'event %s from %s: %s', name, device.dev_id, payload))
     SESSIONS[device.dev_id] = session
     session.start()
     tasks[device.dev_id] = session.running_tasks()
+    if is_reconnect:
+        # The head may have drifted while the connection was down (or the
+        # camera may have rebooted and reset to (0, 0) already). Drive it
+        # back to (0, 0) as the safest known state; the caller can override
+        # by configuring on_reconnect on the Device wrapper for this use case.
+        asyncio.create_task(session.home())
+    _was_connected.add(device.dev_id)
     notify_new_device()
 
 
@@ -49,6 +64,7 @@ def on_device_lost(device):
     logger.warning('Device %s lost; discovery will pick it up again', device.dev_id)
     SESSIONS.pop(device.dev_id, None)
     tasks.pop(device.dev_id, None)
+    _was_connected.discard(device.dev_id)
     notify_new_device()
 
 

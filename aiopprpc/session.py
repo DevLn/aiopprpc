@@ -1179,6 +1179,176 @@ class Session(PacketQueueMixin, MediaQueueMixin):
         finally:
             await self.ptz_stop()
 
+    async def ptz_raw(self, func_code, para1=0, para2=0, channel=0):
+        """Send a raw PtzCtrl with all four fields populated.
+
+        The new SDK's PtzCtrl is ``Req{channel, func_code, para1, para2}``
+        (extracted from ``libgojni.so``). The library's existing ``ptz()``
+        only sets ``func_code``; this is the version that also sets
+        ``para1`` (preset id for the cruise-control codes 1/2/3/4/22/24)
+        and ``para2`` (dwell time for ``SET_CRUISE``).
+
+        Whether the FT04 firmware accepts the new-SDK cruise-control
+        codes (1=BEGIN_CRUISE_SET, 2=CALL_CRUISE, 3=DELETE_CRUISE,
+        4=END_CRUISE_SET, 22=SET_CRUISE, 24=STOP_CRUISE) is the open
+        question this method exists to test. The FT04 reports
+        ``mconf.psp:0, cruise:0`` in its ``skill.json``, so the
+        hypothesis is that it will reject them with an error code --
+        but it is one hardware test, and the only way to know.
+
+        See ``docs/SDK_COMMANDS_EXTRACTED.md`` for the full E_FUNC_VIDEO_PTZ_CTRL
+        enum and the rationale for the cruise-control code space.
+        """
+        body = (pb_varint(1, int(channel))
+                + pb_varint(2, int(func_code))
+                + pb_varint(3, int(para1))
+                + pb_varint(4, int(para2)))
+        await self.send_command(Commands.PTZ_CTRL, body)
+
+    async def ptz_preset_begin(self, preset_id, channel=0):
+        """Start the ``save preset`` wizard for slot N (1..6).
+
+        Wire form: PtzCtrl {channel, func_code=1 (BEGIN_CRUISE_SET), para1=preset_id}.
+        Save with ``ptz_preset_end()``, abort with ``ptz_stop()``.
+        """
+        await self.ptz_raw(func_code=1, para1=preset_id, channel=channel)
+
+    async def ptz_preset_end(self, preset_id, channel=0):
+        """Commit the position to slot N (1..6).
+
+        Wire form: PtzCtrl {channel, func_code=4 (END_CRUISE_SET), para1=preset_id}.
+        Must come after a successful ``ptz_preset_begin()`` for the same slot.
+        """
+        await self.ptz_raw(func_code=4, para1=preset_id, channel=channel)
+
+    async def ptz_preset_call(self, preset_id, channel=0):
+        """Recall preset N (1..6).
+
+        Wire form: PtzCtrl {channel, func_code=2 (CALL_CRUISE), para1=preset_id}.
+        The camera moves to the saved position. The FT04 firmware's
+        response (move vs reject) is the open question.
+        """
+        await self.ptz_raw(func_code=2, para1=preset_id, channel=channel)
+
+    async def ptz_preset_delete(self, preset_id, channel=0):
+        """Delete preset N (1..6).
+
+        Wire form: PtzCtrl {channel, func_code=3 (DELETE_CRUISE), para1=preset_id}.
+        """
+        await self.ptz_raw(func_code=3, para1=preset_id, channel=channel)
+
+    async def ptz_cruise_start(self, dwell_secs, channel=0):
+        """Start a continuous patrol cycling all configured presets.
+
+        Wire form: PtzCtrl {channel, func_code=22 (SET_CRUISE), para2=dwell_secs}.
+        ``dwell_secs`` is the time the camera sits at each preset before
+        moving to the next; value ``0`` is "use camera default".
+        """
+        await self.ptz_raw(func_code=22, para2=dwell_secs, channel=channel)
+
+    async def ptz_cruise_stop(self, channel=0):
+        """Stop the active patrol.
+
+        Wire form: PtzCtrl {channel, func_code=24 (STOP_CRUISE)}.
+        """
+        await self.ptz_raw(func_code=24, channel=channel)
+
+    # --- position-less "home" + recorded move sequence ---------------------
+    # The FT04 camera has no working preset storage: the new SDK's Psp*
+    # commands either timeout on the wire or return empty bodies, and the
+    # FT04 reports ``mconf.psp:0, cruise:0`` in its ``skill.json``. So the
+    # library has no way to ask the camera "where is the head?" or "go to
+    # saved position N". The PTZ head is open-loop -- the stepper counts
+    # are lost on reboot, and a fresh boot always lands at (0, 0).
+    #
+    # The workaround is the inverse of that: the reboot always lands at
+    # (0, 0), so the camera *can* be returned to a known home position
+    # simply by moving in one direction long enough to hit the limit.
+    # Once at home, a user-recorded sequence of timed moves can replay
+    # any saved vantage point.
+
+    DEFAULT_HOME_TRAVERSE = 18.0  # seconds; just over the worst-case sweep
+
+    async def home(self, traverse_secs: float = DEFAULT_HOME_TRAVERSE) -> None:
+        """Slam the PTZ head to the (0, 0) corner.
+
+        The FT04 always boots with the head parked at full-left,
+        full-up (the apparent home of the stepper motors). Driving
+        ``left`` for long enough reaches the left hard-stop, then
+        driving ``up`` for long enough reaches the up hard-stop.
+
+        ``traverse_secs`` is the time we let the head run in each
+        direction. Pick a value comfortably above the camera's
+        full-sweep time (the FT04 takes ~12-15 s to traverse a full
+        355° pan at default speed). Slightly over-shoot is safe; the
+        head just presses against the hard-stop and the motor stalls
+        silently.
+
+        Each direction is bracketed with a ``ptz_stop()`` so the camera
+        exits the move cleanly and the session doesn't keep the head
+        pressed against the stop.
+        """
+        await self.ptz('left')
+        try:
+            await asyncio.sleep(traverse_secs)
+        finally:
+            await self.ptz_stop()
+        await self.ptz('up')
+        try:
+            await asyncio.sleep(traverse_secs)
+        finally:
+            await self.ptz_stop()
+
+    async def recall_preset(self, sequence: list[tuple[str, float]],
+                            settle_secs: float = 0.4) -> None:
+        """Replay a recorded move sequence from home (0, 0).
+
+        ``sequence`` is a list of ``(direction, duration)`` pairs; the
+        head is driven in each direction for the recorded duration
+        (in seconds), then stopped. ``settle_secs`` is a small pause
+        inserted between moves to let the head settle before the next
+        direction starts (a small value matters because the camera
+        ignores a new direction while a previous PTZ command is still
+        being processed; the stop is also a command, so a 0-s gap
+        drops the second move).
+
+        Pair this with ``home()``: after a reboot or reconnect, call
+        ``await cam.home()`` and then ``await cam.recall_preset(seq)``
+        to return the camera to a known vantage point.
+        """
+        for direction, duration in sequence:
+            if duration <= 0:
+                continue
+            await self.ptz(direction)
+            try:
+                await asyncio.sleep(duration)
+            finally:
+                await self.ptz_stop()
+            if settle_secs > 0:
+                await asyncio.sleep(settle_secs)
+
+    async def send_raw_command(self, cmdid, body_hex='', timeout=None):
+        """Send an arbitrary command id with a raw hex body. Escape hatch.
+
+        The library does not know the cmdids for the new SDK's
+        ``PspAdd/Call/Del/List`` and ``TimedcruiseGet/Set`` commands
+        (the integers are in the gomobile binary, not in any static
+        table the catalog could extract). This lets the test page
+        send ``PspList`` (or any other) with an empty body to see
+        whether the camera answers and how.
+
+        ``body_hex`` is the raw protobuf body, hex-encoded with
+        ``send_raw_command(cmdid, '0a1408...')``. Whitespace is
+        ignored. Empty string means "send a 0-byte body".
+        """
+        body = bytes.fromhex(body_hex.replace(' ', '').replace('\n', '')) if body_hex.strip() else b''
+        # The send_command wrapper reads the response, but for a
+        # command whose cmdid is unknown to the camera, the response
+        # code may be the only signal we get. Use check_code=False so
+        # any non-zero response code still returns the body.
+        return await self.send_command(int(cmdid), body, with_response=True,
+                                       timeout=timeout, check_code=False)
+
     # --- network ---------------------------------------------------------
     async def get_network_info(self) -> dict:
         fields = await self.send_command(Commands.NET_INFO)

@@ -81,6 +81,14 @@ def _json_error(message, status):
     return web.json_response({'status': 'error', 'message': message}, status=status)
 
 
+# Per-camera state for the recorded "home" preset. Single slot per dev_id;
+# the page also mirrors this to localStorage so a reload doesn't lose it.
+# Module-level so the dict survives across HTTP requests (each request
+# creates a fresh closure for the command handlers, which would otherwise
+# start every preset-save with an empty dict).
+_preset_storage: dict[str, list] = {}
+
+
 def _get_session(request):
     session = SESSIONS.get(request.match_info['dev_id'])
     if session is None:
@@ -182,8 +190,157 @@ def _camera_page_html(dev_id, session):
 
     // PTZ moves continuously until STOP, so hold-to-move is the honest control:
     // press starts, release stops.
-    function hold(dir) { sendCommand('ptz', {direction: dir}); }
-    function release() { sendCommand('ptz-stop', {}); }
+    function hold(dir) { recNoteMoveStart(dir); sendCommand('ptz', {direction: dir}); }
+    function release() { recNoteMoveStop(); sendCommand('ptz-stop', {}); }
+
+    // --- Position-less "home" + recorded move sequence ---
+    // The FT04 has no working preset storage, so the only way to land on
+    // a known vantage point is to drive the head there from (0, 0) using
+    // timed moves. The page keeps the recorded sequence in localStorage
+    // (per device-id) and replays it as a single API call.
+
+    // Recording state. Each move is {dir, startedMs, endedMs}. The
+    // direction is one of 'left','right','up','down'; started/ended are
+    // wall-clock ms since the recording began. Dwell in each direction
+    // is summed and rounded to 0.05s; the page's buttons send 'start'
+    // and 'stop' messages and the user picks when to commit.
+    const _recording = { active: false, startedAt: 0, moves: [], current: null };
+
+    function recLog(msg, isErr=false) {
+        const el = document.getElementById('rec-log');
+        if (!el) return;
+        el.textContent = (isErr ? '[err] ' : '') + msg + '\\n' + el.textContent;
+    }
+    function recRefresh() {
+        const el = document.getElementById('rec-current');
+        if (!el) return;
+        if (!_recording.active) {
+            el.textContent = 'idle';
+        } else if (_recording.current) {
+            el.textContent = `recording: ${_recording.current.dir} for ${((Date.now()-_recording.current.startedMs)/1000).toFixed(1)}s`;
+        } else {
+            el.textContent = `recording: ${_recording.moves.length} moves so far`;
+        }
+    }
+    function recTickInterval() {
+        if (_recording.tickHandle) return;
+        _recording.tickHandle = setInterval(recRefresh, 200);
+    }
+    function recTickStop() {
+        if (_recording.tickHandle) { clearInterval(_recording.tickHandle); _recording.tickHandle = null; }
+    }
+
+    async function homeGo() {
+        // Drives the head to (0, 0). Long-running; updates the page while
+        // it runs so the user knows the request didn't hang.
+        const t = +document.getElementById('home-traverse').value || 18;
+        recLog(`home: driving left+up for ${t}s each (about ${2*t}s total)`);
+        const t0 = Date.now();
+        const r = await sendCommand('home', {traverse_secs: t});
+        const dt = ((Date.now()-t0)/1000).toFixed(1);
+        if (!r) { recLog('home: failed -- see status line', true); return; }
+        recLog(`home: returned in ${dt}s`);
+    }
+
+    async function recStart() {
+        if (_recording.active) { recLog('recording already active', true); return; }
+        // Make sure the head is at (0, 0) before recording -- the move
+        // sequence is replayed from (0, 0), so an offset start will land
+        // somewhere other than the recorded vantage point.
+        recLog('recording: send "home" first if the head is not at (0, 0)');
+        _recording.active = true;
+        _recording.startedAt = Date.now();
+        _recording.moves = [];
+        _recording.current = null;
+        recTickInterval();
+        recRefresh();
+    }
+    async function recStop() {
+        if (!_recording.active) { recLog('not recording', true); return; }
+        // Close out the current move if any
+        if (_recording.current) {
+            const dur = (Date.now() - _recording.current.startedMs) / 1000;
+            if (dur > 0.05) _recording.moves.push([_recording.current.dir, +dur.toFixed(2)]);
+            _recording.current = null;
+        }
+        _recording.active = false;
+        recTickStop();
+        recRefresh();
+        recLog(`recording: stopped, ${_recording.moves.length} moves captured`);
+    }
+    function recNoteMoveStart(dir) {
+        if (!_recording.active) return;
+        // Close the previous move
+        if (_recording.current) {
+            const dur = (Date.now() - _recording.current.startedMs) / 1000;
+            if (dur > 0.05) _recording.moves.push([_recording.current.dir, +dur.toFixed(2)]);
+        }
+        _recording.current = {dir, startedMs: Date.now()};
+        recRefresh();
+    }
+    function recNoteMoveStop() {
+        if (!_recording.active || !_recording.current) return;
+        const dur = (Date.now() - _recording.current.startedMs) / 1000;
+        if (dur > 0.05) _recording.moves.push([_recording.current.dir, +dur.toFixed(2)]);
+        _recording.current = null;
+        recRefresh();
+    }
+    async function recSave() {
+        if (_recording.active) { recLog('stop recording before saving', true); return; }
+        const r = await sendCommand('preset-save', {sequence: JSON.stringify(_recording.moves)});
+        if (!r) return;
+        recLog(`saved ${r.saved} moves to server`);
+        // Mirror to localStorage so the sequence survives a page reload
+        try { localStorage.setItem('pprpc-preset-' + DEV, JSON.stringify(_recording.moves)); } catch (e) {}
+    }
+    async function recLoad() {
+        // Pull the server's saved sequence (if any) into the page.
+        const r = await sendCommand('preset-get', {});
+        if (!r) return;
+        // Normalise: server sends [dir, dur] arrays (Python tuples JSON-serialised
+        // as arrays). Old localStorage may have {dir, dur} objects. Both become
+        // [dir, dur] pairs.
+        _recording.moves = (r.sequence || []).map(m =>
+            Array.isArray(m) ? m : [m.dir, m.dur]
+        );
+        recLog(`loaded ${_recording.moves.length} moves from server`);
+        recRefresh();
+    }
+    async function recReplay() {
+        if (_recording.moves.length === 0) { recLog('no moves to replay', true); return; }
+        const settle = +document.getElementById('rec-settle').value || 0.4;
+        // m is [dir, dur] from the server; dir is a string, dur is a number.
+        const total = _recording.moves.reduce((s, m) => s + m[1], 0);
+        recLog(`replaying ${_recording.moves.length} moves (${total.toFixed(1)}s of moves + settle=${settle}s)`);
+        const t0 = Date.now();
+        const r = await sendCommand('recall-preset', {
+            sequence: JSON.stringify(_recording.moves), settle_secs: settle,
+        });
+        const dt = ((Date.now()-t0)/1000).toFixed(1);
+        if (!r) { recLog('replay: failed -- see status line', true); return; }
+        recLog(`replay: returned in ${dt}s`);
+    }
+    function recClear() {
+        _recording.moves = [];
+        _recording.current = null;
+        recRefresh();
+        recLog('cleared recorded moves');
+    }
+    // Try to load any locally-saved sequence on first paint so the user
+    // doesn't have to re-record after a reload.
+    document.addEventListener('DOMContentLoaded', () => {
+        try {
+            const raw = localStorage.getItem('pprpc-preset-' + DEV);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                // Normalise old {dir,dur} objects and new [dir,dur] pairs to [dir,dur].
+                _recording.moves = parsed.map(m =>
+                    Array.isArray(m) ? m : [m.dir, m.dur]
+                );
+                recLog(`restored ${_recording.moves.length} moves from local cache`);
+            }
+        } catch (e) {}
+    });
 
     // The select always sits on its placeholder, so picking the same option
     // twice sends the command twice instead of silently doing nothing the
@@ -612,6 +769,52 @@ def _camera_page_html(dev_id, session):
           onmouseleave="release()">&darr;</button>
  </div>
 </fieldset>
+<!--
+  Preset research summary (unsuccessful):
+  - FT04 firmware does not implement the new SDK's Psp* (BEGIN/END/CALL/DELETE_CRUISE_SET)
+    or Timedcruise* commands. cmdid sweep of 2665-2700 and 2721-2722 with 5 body shapes
+    each: all returned either non-zero codes, empty bodies, or timeouts. The camera's
+    skill.json reports mconf.psp:0, cruise:0, confirming the firmware has no preset
+    storage. cmdids for PspAdd/Call/Del/List live in the gomobile binary as raw ARM64
+    integers and were not extractable from static analysis. Workaround: see the
+    "Recorded preset" section below.
+-->
+<fieldset><legend>Recorded preset (position-less workaround)</legend>
+ <p class="note">The FT04 has no preset storage. The head always boots to (0, 0)
+  (full-left, full-up). To return to a saved vantage point: <b>1)</b> drive
+  to (0, 0) with "go home", then <b>2)</b> replay a recorded sequence of
+  timed moves. Each sequence is a list of <code>[direction, seconds]</code>
+  pairs stored server-side (per camera) and in <code>localStorage</code>.</p>
+ <fieldset style="border: 1px solid #ccc; margin: .4rem 0;">
+  <legend>1. drive to (0, 0)</legend>
+  <label>seconds per direction:
+   <input id="home-traverse" type="number" min="1" max="60"
+          value="18" size="4"> (default 18 s; full sweep ~12-15 s)</label>
+  <button onclick="homeGo()">go home</button>
+  <span id="rec-current" class="note">idle</span>
+ </fieldset>
+ <fieldset style="border: 1px solid #ccc; margin: .4rem 0;">
+  <legend>2. record (use Pan / tilt buttons above)</legend>
+  <button onclick="recStart()">start recording</button>
+  <button onclick="recStop()">stop recording</button>
+  <button onclick="recClear()">clear</button>
+  <span class="note">Head must be at (0, 0) before recording. Each PTZ hold/release
+   becomes one <code>[dir, seconds]</code> entry. Reloaded from localStorage
+   on page paint.</span>
+ </fieldset>
+ <fieldset style="border: 1px solid #ccc; margin: .4rem 0;">
+  <legend>3. save / load / replay</legend>
+  <button onclick="recSave()">save (server + browser)</button>
+  <button onclick="recLoad()">load from server</button>
+  <label>settle:
+   <input id="rec-settle" type="number" min="0" max="2"
+          step="0.1" value="0.4" size="4"> s</label>
+  <button onclick="recReplay()">replay</button>
+  <span class="note">Server holds one sequence per camera; browser one per localStorage key.
+   Replay assumes head is at (0, 0).</span>
+ </fieldset>
+ <pre id="rec-log" style="max-height: 6rem; overflow-y: auto; font-size: .8rem; background: #f9f9f9; padding: .3rem;">no preset actions yet</pre>
+</fieldset>
 <fieldset><legend>Settings</legend>{selects}</fieldset>
 <fieldset><legend>Light</legend>
  <button onclick="flashlight()">toggle flashlight</button>
@@ -804,6 +1007,42 @@ async def handle_commands(request):
             return {'ack': False, 'detail': f'{type(err).__name__}: {err}'}
         return {'ack': True}
 
+    async def home(traverse_secs=18, **kwargs):
+        """Drive the PTZ head to the (0, 0) corner via timed moves."""
+        t = max(1.0, float(traverse_secs))
+        await session.home(t)
+
+    async def recall_preset(sequence, settle_secs=0.4, **kwargs):
+        """Replay a list of (direction, duration) moves from home.
+
+        ``sequence`` arrives from the page as a JSON string like
+        ``[["right",1.2],["down",0.4]]``. Decoding happens here.
+        """
+        import json as _json
+        if isinstance(sequence, str):
+            sequence = _json.loads(sequence)
+        moves = [(str(d), float(t)) for d, t in sequence]
+        await session.recall_preset(moves, settle_secs=float(settle_secs))
+
+    # Per-camera state for the recorded preset. The page loads/saves it as
+    # a JSON blob; the server stores it keyed on dev_id and reuses it for
+    # the next replay. Nothing fancier needed -- it's a single slot.
+    # NOTE: defined at module level (below) so it persists across requests.
+
+    async def preset_get(**kwargs):
+        dev_id = request.match_info['dev_id']
+        return {'sequence': _preset_storage.get(dev_id, [])}
+
+    async def preset_save(sequence, **kwargs):
+        """Save a recorded move sequence for the camera."""
+        import json as _json
+        if isinstance(sequence, str):
+            sequence = _json.loads(sequence)
+        moves = [(str(d), float(t)) for d, t in sequence]
+        dev_id = request.match_info['dev_id']
+        _preset_storage[dev_id] = moves
+        return {'saved': len(moves), 'sequence': moves}
+
     async def stop_video(**kwargs):
         VIDEO_OFF.add(request.match_info['dev_id'])
         await session.stop_video()
@@ -815,6 +1054,10 @@ async def handle_commands(request):
     web2cmd = {
         'ptz': ptz if hasattr(session, 'ptz') else None,
         'ptz-stop': getattr(session, 'ptz_stop', None),
+        'home': home if hasattr(session, 'home') else None,
+        'recall-preset': recall_preset if hasattr(session, 'recall_preset') else None,
+        'preset-get': preset_get,
+        'preset-save': preset_save,
         'start-video': start_video,
         'stop-video': stop_video,
         'start-audio': getattr(session, 'start_audio', None),
