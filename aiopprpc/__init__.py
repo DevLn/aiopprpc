@@ -4,6 +4,7 @@ from .const import (  # noqa: F401
     PREFIX,
     WIFI_SET_FIELD5,
     Commands,
+    IotCmd,
     command_name,
     describe_supported,
 )

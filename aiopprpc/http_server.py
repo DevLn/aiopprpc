@@ -59,7 +59,7 @@ SETTING_SELECTS = [
 ]
 
 #: The light controls, kept apart from the selects above because the light on
-#: this camera is split across two unrelated mechanisms: a mode datapoint with
+#: this camera is split across two unrelated mechanisms: a mode IoT command with
 #: a read-back (588/589, below) and a stateless toggle (201, its own button).
 LIGHT_SELECTS = [
     ('set-night-light', 'Night light mode', NightLightMode, 'night_light'),
@@ -818,20 +818,20 @@ def _camera_page_html(dev_id, session):
 <fieldset><legend>Settings</legend>{selects}</fieldset>
 <fieldset><legend>Light</legend>
  <button onclick="flashlight()">toggle flashlight</button>
- <span class="note" id="fl-log">datapoint 201 &mdash; press it and watch the picture</span>
+ <span class="note" id="fl-log">IoT cid 201 &mdash; press it and watch the picture</span>
  <br>
  {lights}
- <p class="note"><b>Flashlight</b> (dp 201) is a momentary <b>toggle</b>, not an
-  on/off: the camera flips the light for any message sent to that datapoint and
-  ignores the payload. It has <b>no readable state</b> &mdash; a "read" of dp 201
+ <p class="note"><b>Flashlight</b> (IoT cid 201) is a momentary <b>toggle</b>, not an
+  on/off: the camera flips the light for any ExecIOTCMD sent to that cid and
+  ignores the payload. It has <b>no readable state</b> &mdash; a "read" of cid 201
   flips it too, which is why there is no read-state button here and no getter in
   the library. The only way to know whether it is on is to look at the picture.
-  <br><b>Night light mode</b> (dp 588) is separate, and is the one light setting
-  the camera reads back (dp 589). The mode <i>names</i> come from the order the
+  <br><b>Night light mode</b> (cid 588) is separate, and is the one light setting
+  the camera reads back (cid 589). The mode <i>names</i> come from the order the
   vendor app's buttons were pressed during the capture, not from the bytes, so
   treat "Full Color = white LED on" as unverified &mdash; that is the same kind of
   evidence that once had motion Low and Medium swapped.
-  <br>The app's dp 23116 ("night light on/off") is not on this page: it is written
+  <br>The app's cid 23116 ("night light on/off") is not on this page: it is written
   once by the app when its night screen opens, no capture ever writes the off
   direction, nothing reads it back, and neither direction did anything observable
   here. It survives in the library as <code>enable_night_light()</code>, a probe.</p>
@@ -961,7 +961,7 @@ async def handle_commands(request):
         await method(int(value))
 
     async def toggle_flashlight(**kwargs):
-        # No parameters on purpose: dp 201 ignores its payload, so offering a
+        # No parameters on purpose: cid 201 ignores its payload, so offering a
         # value here would be four controls that all do the same thing.
         await session.toggle_flashlight()
 

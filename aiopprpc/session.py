@@ -38,17 +38,17 @@ from .const import (
     TALK_CHANNEL,
     TALK_ENC_TRAILER,
     TALK_FRAME_BYTES,
-    UNREADABLE_DATAPOINTS,
+    UNREADABLE_IOT_CMDS,
     WEEKDAYS,
     WIFI_SET_FIELD5,
     Commands,
-    Datapoint,
     Encryption,
     Flag,
+    IotCmd,
     Ptz,
     RpcType,
     command_name,
-    datapoint_name,
+    iot_cmd_name,
 )
 from .crypto import ENC_METHODS, decrypt_av
 from .exceptions import AuthError, CommandError, NotConnectedError, PacketError
@@ -63,6 +63,7 @@ from .protocol import (
     pb_bytes,
     pb_fields,
     pb_message,
+    pb_packed_varints,
     pb_repeated,
     pb_signed,
     pb_string,
@@ -766,23 +767,23 @@ class Session(PacketQueueMixin, MediaQueueMixin):
     async def _app_handshake(self):
         """The opening exchange every capture shows the app performing.
 
-        `2653` (name unrecovered, answers `{1:4, 2:<big>, 3:<big>}`) goes first,
-        then three status datapoints. Nothing here is required to get video; we
-        send it because the app does, and it is best effort throughout.
+        `2653` (the SDK's ServiceDesc names it StorageInfo, but its `{1:4,
+        2:<big>, 3:<big>}` answer does not read as sizes) goes first, then three
+        status IoT commands. Nothing here is required to get video; we send it
+        because the app does, and it is best effort throughout.
 
         These go out as the app's exact message -- did present AND a `00` value
         byte (docs/decoded/light.txt:39,43,51) -- rather than as a value-less
-        read. What these three datapoints do is unknown, and dp 201 proved that
-        a value-less request is not automatically a harmless read: on that
-        datapoint it actuates. The app's bytes are the only shape observed to be
-        safe on this hardware, so send those and nothing else. The answers are
-        discarded either way.
+        read. What these three cids do is unknown, and cid 201 proved that a
+        value-less request is not automatically a harmless read: on that cid it
+        actuates. The app's bytes are the only shape observed to be safe on this
+        hardware, so send those and nothing else. The answers are discarded
+        either way.
         """
         await self._attempt('capability probe', self.send_command(Commands.CAPABILITIES))
-        for datapoint in (Datapoint.STATUS_POLL, Datapoint.STATUS_POLL_23131,
-                          Datapoint.STATUS_POLL_23113):
-            await self._attempt(f'status poll {int(datapoint)}',
-                                self.datapoint_set(datapoint, b'\x00', with_did=True))
+        for cid in (IotCmd.STATUS_POLL, IotCmd.STATUS_POLL_23131, IotCmd.STATUS_POLL_23113):
+            await self._attempt(f'status poll {int(cid)}',
+                                self.iot_cmd_set(cid, b'\x00', with_did=True))
 
     async def _attempt(self, what, coro):
         """Run a probe whose failure must not abort the session."""
@@ -1520,12 +1521,12 @@ class Session(PacketQueueMixin, MediaQueueMixin):
         await self.send_command(Commands.IRCUT_SET, pb_varint(2, int(mode)))
 
     async def get_night_light(self) -> NightLightMode:
-        """Night-light mode, read through datapoint 589."""
-        value = await self.datapoint_get(Datapoint.NIGHT_LIGHT_GET)
+        """Night-light mode, read through IoT cid 589."""
+        value = await self.iot_cmd_get(IotCmd.NIGHT_LIGHT_GET)
         return NightLightMode(value[0] if value else 0)
 
     async def set_night_light(self, mode):
-        """Set night-light mode through datapoint 588, read back through 589.
+        """Set night-light mode through IoT cid 588, read back through 589.
 
         What the capture proves is the transport, not the labels: 588 = 2 read
         back from 589 as 2, and 588 = 0 read back as 0
@@ -1538,38 +1539,38 @@ class Session(PacketQueueMixin, MediaQueueMixin):
         turns the white illuminator on" as unverified. The light that is
         *observed* to change on this unit is :meth:`toggle_flashlight`.
         """
-        await self.datapoint_set(Datapoint.NIGHT_LIGHT_SET, bytes([int(mode)]))
+        await self.iot_cmd_set(IotCmd.NIGHT_LIGHT_SET, int(mode))
 
     async def enable_night_light(self):
-        """Replay the app's night-screen write (dp 23116 = 01). **Unverified.**
+        """Replay the app's night-screen write (cid 23116 = 01). **Unverified.**
 
         Takes no argument because only the ``01`` direction has ever been seen.
         The app writes it once, with the did, as its night screen opens
         (docs/decoded/night.txt:18); no capture ever writes ``00``, so an
         ``enabled=False`` would be a byte this protocol has not been observed
-        to carry. The ack has no value field and there is no get datapoint, so
+        to carry. The ack has no value field and there is no get cid, so
         nothing can confirm it landed -- and on this unit neither direction
         produced any visible effect. Kept as a probe for parity with the app,
         which is why it is not on the test server's page.
         """
-        await self.datapoint_set(Datapoint.NIGHT_LIGHT_ENABLE, b'\x01', with_did=True)
+        await self.iot_cmd_set(IotCmd.NIGHT_LIGHT_ENABLE, 1, with_did=True)
 
     async def toggle_flashlight(self):
         """Flip the white light. **There is no way to read its state.**
 
-        dp 201 is momentary: the camera flips the light for any ExecIOTCMD
+        cid 201 is momentary: the camera flips the light for any ExecIOTCMD
         addressed to it and ignores the payload, so this takes no argument --
         there is nothing to set, only a press. The app's exact bytes go on the
         wire, did included, because both captured presses carried them
         (docs/decoded/light.txt:55,59).
 
-        There is deliberately no getter. A value-less "read" of dp 201 actuates
+        There is deliberately no getter. A value-less "read" of cid 201 actuates
         it just as a write does, so asking the light what it is doing turns it
-        off; see :data:`UNREADABLE_DATAPOINTS`. A caller that needs to know the
+        off; see :data:`UNREADABLE_IOT_CMDS`. A caller that needs to know the
         state has to look at the picture.
         """
-        await self.datapoint_set(Datapoint.FLASHLIGHT_TOGGLE,
-                                 FLASHLIGHT_TOGGLE_PAYLOAD, with_did=True)
+        await self.iot_cmd_set(IotCmd.FLASHLIGHT_TOGGLE,
+                               FLASHLIGHT_TOGGLE_PAYLOAD, with_did=True)
 
     # --- orientation / LED / system ---------------------------------------
     async def get_flip(self) -> FlipMode:
@@ -1588,55 +1589,77 @@ class Session(PacketQueueMixin, MediaQueueMixin):
         # Fire and forget: the camera may go down before it answers.
         await self.send_command(Commands.REBOOT, with_response=False)
 
-    # --- generic datapoints -------------------------------------------------
-    def _datapoint_body(self, dp, value=None, with_did=False):
-        """Build the ExecIOTCMD envelope: ``{1:{[2:did,] 4:{1:dp[,2:val]}, 6:ts, 7:1}}``.
+    # --- generic IoT commands (ExecIOTCMD) ---------------------------------
+    def _iot_cmd_body(self, cid, value=None, with_did=False):
+        """Build the ExecIOTCMD envelope the SDK calls ``PpiotCmd``.
 
-        Whether the did is present is per-datapoint, copied from the app: 588
-        and 589 go without it (docs/decoded/night.txt:46,50), while 201, 554,
-        23113, 23116 and 23131 all carry it (light.txt:39,43,51,55;
-        night.txt:18). The default is False only because 588/589 are the
-        busiest callers here.
+        Wire shape ``{1:{[2:did,] 4:{1:cid[,2:pint]}, 6:timestamp, 7:ans=1}}``,
+        i.e. ``PpiotCmd{did, cmds:[BaseCmd{cid, pint}], timestamp, ans}`` from
+        the SDK's ``common.proto``. Field 4.2 is ``BaseCmd.pint`` -- a packed
+        ``repeated int64`` -- which is why the captured values are ``00``,
+        ``02`` and ``00 00 00``: the int lists ``[0]``, ``[2]`` and ``[0, 0, 0]``.
 
-        Field 7 is 1 on reads as well as writes -- it is not a write flag; the
-        read of 589 at night.txt:46 sends 7:1 too. The only read/write
-        discriminator on the wire is whether the inner value field is present.
+        ``value`` may be an int or a sequence of ints (encoded as packed
+        varints), or raw ``bytes`` copied into the field verbatim -- the form
+        every caller used before the schema was known, kept so their bytes do
+        not change. For values below 128 the two forms are identical.
+
+        Whether the did is present is per-cid, copied from the app: 588 and 589
+        go without it (docs/decoded/night.txt:46,50), while 201, 554, 23113,
+        23116 and 23131 all carry it (light.txt:39,43,51,55; night.txt:18). The
+        default is False only because 588/589 are the busiest callers here.
+
+        Field 7 (``ans``) is 1 on reads as well as writes -- it asks for an
+        answer, it is not a write flag; the read of 589 at night.txt:46 sends
+        7:1 too. The only read/write discriminator on the wire is whether
+        ``pint`` is present.
         """
-        inner = pb_varint(1, int(dp))
+        inner = pb_varint(1, int(cid))
         if value is not None:
-            inner += pb_bytes(2, value)
+            if isinstance(value, (bytes, bytearray)):
+                inner += pb_bytes(2, bytes(value))
+            elif isinstance(value, int):
+                inner += pb_packed_varints(2, [value])
+            else:
+                inner += pb_packed_varints(2, value)
         parts = pb_string(2, self.dev.dev_id) if with_did else b''
         parts += pb_message(4, inner) + pb_varint(6, int(time.time())) + pb_varint(7, 1)
         return pb_message(1, parts)
 
-    async def datapoint_set(self, dp, value: bytes, with_did=False):
-        """Write a datapoint. The ack never carries the new value: 588 echoes
-        ``00`` whatever was written (docs/decoded/night.txt:50-52), and 201 and
-        23116 answer with no value field at all. Confirm a write by reading its
-        paired get datapoint, where one exists."""
+    async def iot_cmd_set(self, cid, value, with_did=False):
+        """Send an IoT command carrying a value. The ack never carries the new
+        value: 588 echoes ``00`` whatever was written (docs/decoded/night.txt:
+        50-52), and 201 and 23116 answer with no value field at all. Confirm a
+        write by reading its paired get cid, where one exists."""
         await self.send_command(Commands.EXEC_IOT_CMD,
-                                self._datapoint_body(dp, value, with_did))
+                                self._iot_cmd_body(cid, value, with_did))
 
-    async def datapoint_get(self, dp, with_did=False) -> bytes | None:
-        """Read a datapoint. Returns None when the value comes back absent.
+    async def iot_cmd_get(self, cid, with_did=False) -> bytes | None:
+        """Send an IoT command with no value; return the answer's ``pint`` bytes,
+        or None when the value comes back absent.
 
         Absent is not the same as zero: for the identical request shape the
-        camera answers dp 554 with ``00`` but 23131 and 23113 with no value
+        camera answers cid 554 with ``00`` but 23131 and 23113 with no value
         field at all (docs/decoded/light.txt:39-53). Absent means only that the
-        camera had nothing to say about it.
+        camera had nothing to say about it. The bytes are the packed ``repeated
+        int64``; for the single small values seen so far ``value[0]`` is the
+        number.
 
-        Raises ValueError for a datapoint that actuates when read -- see
-        :data:`UNREADABLE_DATAPOINTS`. That is not a hypothetical guard: a
-        "read" of dp 201 presses the flashlight button.
+        Raises ValueError for a cid that actuates when read -- see
+        :data:`UNREADABLE_IOT_CMDS`. That is not a hypothetical guard: a "read"
+        of cid 201 presses the flashlight button.
         """
-        reason = UNREADABLE_DATAPOINTS.get(dp)
+        reason = UNREADABLE_IOT_CMDS.get(cid)
         if reason is not None:
-            raise ValueError(f'datapoint {datapoint_name(int(dp))} cannot be read: {reason}')
+            raise ValueError(f'IoT cid {iot_cmd_name(int(cid))} cannot be read: {reason}')
         fields = await self.send_command(Commands.EXEC_IOT_CMD,
-                                         self._datapoint_body(dp, None, with_did))
+                                         self._iot_cmd_body(cid, None, with_did))
         tree = walk(fields.get(1, b'')) if isinstance(fields.get(1), (bytes, bytearray)) else None
         value = find(tree, [4, 2])
         return bytes(value) if isinstance(value, (bytes, bytearray)) else None
+
+    datapoint_set = iot_cmd_set  # deprecated names, kept for callers
+    datapoint_get = iot_cmd_get
 
 
 def make_session(device: DeviceDescriptor, on_device_lost=None, on_video_state_change=None,

@@ -20,7 +20,7 @@ Protobuf
 We never need full protobuf: no schemas exist for this device. The helpers here
 build the handful of field shapes the camera accepts (pb_varint, pb_string,
 pb_bytes, pb_message) and read replies either shallowly (pb_fields) or
-recursively (walk/find) for the nested messages -- events, datapoints and the
+recursively (walk/find) for the nested messages -- events, IoT commands and the
 motion schedule.
 """
 from dataclasses import dataclass
@@ -258,8 +258,19 @@ def pb_string(field: int, value: str) -> bytes:
 
 
 def pb_message(field: int, *parts: bytes) -> bytes:
-    """Nest a submessage (the datapoint and schedule bodies are two deep)."""
+    """Nest a submessage (the IoT-command and schedule bodies are two deep)."""
     return pb_bytes(field, b''.join(parts))
+
+
+def pb_packed_varints(field: int, values) -> bytes:
+    """A packed ``repeated int64`` field, e.g. ``BaseCmd.pint`` in ExecIOTCMD.
+
+    proto3 packs repeated scalars into one length-delimited field holding the
+    concatenated varints, so ``[0]`` is ``00`` and ``[0, 0, 0]`` is ``00 00 00``
+    -- exactly the bytes the captures show for the small values in use.
+    """
+    payload = b''.join(encode_varint(to_unsigned(int(v))) for v in values)
+    return pb_bytes(field, payload)
 
 
 # --- protobuf readers ---------------------------------------------------------
@@ -329,7 +340,7 @@ def walk(data: bytes):
     ``kind`` is 'V' varint, 'M' nested message, 'B' opaque bytes, 'I32'/'I64'.
     A length-delimited field is reported as 'M' when its content itself parses
     as protobuf, else 'B' -- the usual heuristic, and good enough here because
-    the shapes we read (events, datapoints, schedules) are known in advance.
+    the shapes we read (events, IoT commands, schedules) are known in advance.
     """
     out = []
     cursor = 0

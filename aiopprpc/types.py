@@ -26,7 +26,7 @@ class IRCutMode(IntEnum):
 
 
 class NightLightMode(IntEnum):
-    """Night-light mode, datapoint 588 (set) / 589 (get) via ExecIOTCMD.
+    """Night-light mode, IoT cid 588 (set) / 589 (get) via ExecIOTCMD.
 
     The VALUES are byte-verified: 588 = 2 read back from 589 as 2 and 588 = 0
     read back as 0 (docs/decoded/night.txt:50-64). The NAMES are not -- they
@@ -36,7 +36,7 @@ class NightLightMode(IntEnum):
     so do not rely on FULL_COLOR meaning "white LED on" until someone has
     watched the light while writing it.
 
-    This is *not* the camera's flashlight. That is datapoint 201, a stateless
+    This is *not* the camera's flashlight. That is IoT cid 201, a stateless
     toggle with no mode and no read-back -- see Session.toggle_flashlight.
     """
 
@@ -144,8 +144,10 @@ class DeviceDescriptor:
 
     @property
     def supported_commands(self):
-        """Command IDs the camera declares in its skill.json, as a set of ints.
+        """Cids the camera declares in its skill.json ``support_cmds``, as ints.
 
+        One flat list, two id spaces: RPC command ids (>= 2600) and IoT cids
+        (``BaseCmd.cid`` inside ExecIOTCMD) -- see ``const.IOT_CID_MAX``.
         Empty when discovery carried no skill blob -- callers must treat an
         empty set as "unknown", not as "nothing supported".
         """

@@ -351,7 +351,7 @@ class Device:
     async def enable_night_light(self):
         return await self.session.enable_night_light()
 
-    # No get_flashlight counterpart: reading dp 201 toggles the light, so the
+    # No get_flashlight counterpart: reading cid 201 toggles the light, so the
     # only honest flashlight API is the press itself.
     async def toggle_flashlight(self):
         return await self.session.toggle_flashlight()
@@ -368,8 +368,11 @@ class Device:
     async def reboot(self):
         return await self.session.reboot()
 
-    async def datapoint_get(self, dp, with_did=False):
-        return await self.session.datapoint_get(dp, with_did)
+    async def iot_cmd_get(self, cid, with_did=False):
+        return await self.session.iot_cmd_get(cid, with_did)
 
-    async def datapoint_set(self, dp, value, with_did=False):
-        return await self.session.datapoint_set(dp, value, with_did)
+    async def iot_cmd_set(self, cid, value, with_did=False):
+        return await self.session.iot_cmd_set(cid, value, with_did)
+
+    datapoint_get = iot_cmd_get  # deprecated names, kept for callers
+    datapoint_set = iot_cmd_set
